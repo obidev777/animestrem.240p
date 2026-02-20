@@ -1,7 +1,7 @@
-gunicorn
 Flask==2.3.3
 requests==2.31.0
 beautifulsoup4==4.12.2
 moviepy==1.0.3
 mega.py==1.0.6
 gunicorn==21.2.0
+
