@@ -3,5 +3,5 @@ flask
 requests
 beautifulsoup4
 mega.py
-mega
 moviepy
+
