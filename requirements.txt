@@ -4,6 +4,3 @@ requests
 beautifulsoup4
 mega.py
 moviepy
-imageio[ffmpeg]
-imageio
-
