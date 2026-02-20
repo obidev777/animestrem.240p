@@ -3,7 +3,7 @@ flask
 requests
 beautifulsoup4
 mega.py
-mega
 moviepy
 imageio[ffmpeg]
 imageio
+
