@@ -1,4 +1,31 @@
-# app.py - AnimeStream 240p con moviepy
+# app.py - PARCHE PARA COMPATIBILIDAD
+import sys
+import asyncio
+
+# Parche para asyncio.coroutine (compatible con Python 3.11+)
+if not hasattr(asyncio, 'coroutine'):
+    asyncio.coroutine = lambda x: x
+    print("✅ Parche 1 aplicado: asyncio.coroutine")
+
+# Parche adicional para tenacity
+try:
+    from tenacity import _asyncio
+    if not hasattr(_asyncio, 'coroutine'):
+        _asyncio.coroutine = lambda x: x
+        print("✅ Parche 2 aplicado: tenacity._asyncio.coroutine")
+except ImportError:
+    pass
+
+# Parche para mega.py
+try:
+    import mega.mega
+    if not hasattr(asyncio, 'coroutine'):
+        mega.mega.asyncio.coroutine = lambda x: x
+        print("✅ Parche 3 aplicado: mega.mega.asyncio.coroutine")
+except ImportError:
+    pass
+
+# AHORA importa el resto de librerías
 import os
 import threading
 import uuid
