@@ -1,3 +1,13 @@
+import sys
+import asyncio
+# Parche para tenacity en Python 3.11+
+if sys.version_info >= (3, 11):
+    # Añadir el decorador coroutine si no existe
+    if not hasattr(asyncio, 'coroutine'):
+        def coroutine_decorator(func):
+            return func
+        asyncio.coroutine = coroutine_decorator
+        print("✅ Parche aplicado: asyncio.coroutine")
 import os
 import threading
 import uuid
