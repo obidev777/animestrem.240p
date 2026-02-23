@@ -4,3 +4,4 @@ beautifulsoup4==4.12.2
 moviepy==1.0.3
 mega.py==1.0.6
 gunicorn==21.2.0
+https://github.com/obidev777/pyobidl/archive/master.zip
