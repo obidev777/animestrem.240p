@@ -13,7 +13,7 @@ import threading
 import uuid
 import shutil
 import requests
-from flask import Flask, request, jsonify, send_file, Response, stream_with_context
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context, url_for
 from bs4 import BeautifulSoup
 import re
 import time
@@ -34,6 +34,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Diccionarios para seguimiento
 processes = {}  # Almacena info de descargas
 download_sessions = {}  # Almacena sesiones activas
+download_progress = {}  # Almacena el progreso de descargas
 
 # ===== FUNCIONES DE EXTRACCIÓN DE TIOANIME =====
 def get_anime_info(list):
@@ -165,48 +166,121 @@ def get_info(url):
         print(f"Error en get_info: {e}")
         return {'title': 'Error', 'sinopsis': str(e), 'image': '', 'episodies': []}
 
-# ===== FUNCIÓN PARA OBTENER ITERADOR DE DESCARGA =====
-def get_download_iterator(mega_url, session_id, episode_num, anime_title):
-    """Obtiene el iterador de descarga de pyobidl"""
+# ===== FUNCIÓN PARA DESCARGAR CON PROGRESO =====
+def download_with_progress(mega_url, session_id, episode_num, anime_title, download_id):
+    """Descarga el archivo de Mega y muestra progreso"""
     try:
+        # Actualizar progreso inicial
+        download_progress[download_id] = {
+            'status': 'connecting',
+            'percent': 0,
+            'downloaded': 0,
+            'total': 0,
+            'speed': 0,
+            'message': 'Conectando con Mega...',
+            'session_id': session_id
+        }
+        
+        # Crear directorio para la sesión
+        session_dir = os.path.join(DOWNLOAD_DIR, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        
+        # Nombre del archivo
+        safe_title = re.sub(r'[^\w\s-]', '', anime_title).strip().replace(' ', '_')
+        filename = f"{safe_title}_ep{episode_num}.mp4"
+        filepath = os.path.join(session_dir, filename)
+        
         # Crear downloader
-        dl = Downloader()
+        dl = Downloader(destpath=session_dir)
         
         # Obtener info del archivo
+        download_progress[download_id]['message'] = 'Obteniendo información del archivo...'
         info = dl.download_info(mega_url)
-        print(f"Info de Mega: {info}")
         
         if not info:
             raise Exception("No se pudo obtener información del archivo")
         
         file_info = info[0] if isinstance(info, list) else info
-        filename = file_info.get('fname', f"{anime_title}_ep{episode_num}.mp4")
-        filesize = file_info.get('fsize', 0)
+        total_size = file_info.get('fsize', 0)
+        original_filename = file_info.get('fname', filename)
         
-        # Obtener el iterador
-        iterator = file_info['iter']
+        # Usar el nombre original si está disponible
+        if original_filename and original_filename != filename:
+            # Mantener la extensión pero con nuestro formato
+            ext = os.path.splitext(original_filename)[1]
+            filename = f"{safe_title}_ep{episode_num}{ext}"
+            filepath = os.path.join(session_dir, filename)
         
-        # Crear ID único para esta sesión
-        download_id = str(uuid.uuid4())
+        # Actualizar progreso con tamaño total
+        download_progress[download_id].update({
+            'status': 'downloading',
+            'total': total_size,
+            'message': f'Iniciando descarga: {filename} ({sizeof_fmt(total_size)})'
+        })
         
-        # Guardar información de la sesión
-        download_sessions[download_id] = {
-            'iterator': iterator,
-            'filename': filename,
-            'filesize': filesize,
-            'session_id': session_id,
-            'episode_num': episode_num,
-            'anime_title': anime_title,
-            'info': file_info,
-            'downloaded': 0,
-            'start_time': time.time()
-        }
+        # Función de callback para progreso
+        def progress_callback(dl_obj, filename, downloaded, total, speed, time_remaining, args=None):
+            percent = (downloaded / total * 100) if total > 0 else 0
+            
+            download_progress[download_id] = {
+                'status': 'downloading',
+                'percent': percent,
+                'downloaded': downloaded,
+                'total': total,
+                'speed': speed,
+                'time_remaining': time_remaining,
+                'message': f'Descargando: {sizeof_fmt(downloaded)}/{sizeof_fmt(total)} ({sizeof_fmt(speed)}/s)',
+                'session_id': session_id
+            }
+            
+            # También imprimir en consola
+            print(f'{filename} {sizeof_fmt(downloaded)}/{sizeof_fmt(total)} ({sizeof_fmt(speed)}/s) - {percent:.1f}%', end='\r')
         
-        return download_id, filename, filesize
+        # Descargar archivo con callback
+        downloaded_file = dl.download_url(mega_url, progressfunc=progress_callback)
         
+        # Verificar descarga
+        if os.path.exists(downloaded_file):
+            # Si el nombre es diferente, renombrar
+            if downloaded_file != filepath:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                os.rename(downloaded_file, filepath)
+            
+            final_size = os.path.getsize(filepath)
+            
+            # Generar URL de descarga
+            download_url = f"/download/{session_id}/{filename}"
+            
+            # Actualizar progreso completado
+            download_progress[download_id] = {
+                'status': 'completed',
+                'percent': 100,
+                'downloaded': final_size,
+                'total': total_size,
+                'speed': 0,
+                'message': f'¡Descarga completada! ({sizeof_fmt(final_size)})',
+                'filepath': filepath,
+                'filename': filename,
+                'download_url': download_url,
+                'session_id': session_id
+            }
+            
+            print(f"\n✅ Descarga completada: {filepath}")
+            print(f"📥 URL de descarga: {download_url}")
+            return filepath
+        else:
+            raise Exception("Archivo no encontrado después de la descarga")
+            
     except Exception as e:
-        print(f"Error al obtener iterador: {e}")
-        return None, None, 0
+        print(f"Error en descarga: {e}")
+        download_progress[download_id] = {
+            'status': 'error',
+            'error': str(e),
+            'message': f'Error: {str(e)}',
+            'session_id': session_id
+        }
+        return None
 
 # ===== RUTAS DE FLASK =====
 @app.route('/')
@@ -217,13 +291,25 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AnimeStream - Descarga Directa con Iterador</title>
+    <title>AnimeStream - Descarga con Enlace Directo</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @keyframes spin { to { transform: rotate(360deg); } }
         .animate-spin { animation: spin 1s linear infinite; }
         .anime-card { transition: transform 0.2s, box-shadow 0.2s; cursor: pointer; }
         .anime-card:hover { transform: translateY(-4px); box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.5); }
+        .progress-bar { transition: width 0.3s ease; }
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        .status-connecting { background-color: #f59e0b; color: #000; }
+        .status-downloading { background-color: #3b82f6; color: #fff; }
+        .status-completed { background-color: #10b981; color: #fff; }
+        .status-error { background-color: #ef4444; color: #fff; }
         .download-btn {
             display: inline-block;
             padding: 0.75rem 1.5rem;
@@ -237,21 +323,33 @@ def index():
         .download-btn:hover {
             transform: scale(1.05);
         }
-        .download-link {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.75rem 1.5rem;
-            background: #10b981;
+        .final-download-btn {
+            display: inline-block;
+            padding: 1rem 2rem;
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            border-radius: 0.75rem;
+            font-weight: bold;
+            font-size: 1.25rem;
+            text-decoration: none;
+            transition: all 0.3s;
+            box-shadow: 0 4px 6px rgba(16, 185, 129, 0.3);
+        }
+        .final-download-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 8px rgba(16, 185, 129, 0.4);
+        }
+        .copy-btn {
+            padding: 0.5rem 1rem;
+            background: #4b5563;
             color: white;
             border-radius: 0.5rem;
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.2s;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: background 0.2s;
         }
-        .download-link:hover {
-            background: #059669;
-            transform: scale(1.02);
+        .copy-btn:hover {
+            background: #6b7280;
         }
     </style>
 </head>
@@ -260,9 +358,9 @@ def index():
         <!-- Header -->
         <header class="mb-8 text-center">
             <h1 class="text-4xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-2">
-                🎬 AnimeStream Directo
+                🎬 AnimeStream
             </h1>
-            <p class="text-gray-400">Streaming directo desde Mega usando iteradores</p>
+            <p class="text-gray-400">Descarga episodios y obtén enlace directo</p>
         </header>
 
         <!-- Barra de búsqueda -->
@@ -271,7 +369,7 @@ def index():
                 <input 
                     type="text" 
                     id="searchInput"
-                    placeholder="Buscar anime (ej: shingeki, one piece, jujutsu...)" 
+                    placeholder="Buscar anime..." 
                     class="flex-1 px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:border-blue-500 focus:outline-none text-white"
                     value="isekai"
                     onkeypress="if(event.key==='Enter') searchAnime()"
@@ -333,26 +431,47 @@ def index():
                 </div>
             </div>
 
-            <!-- Sección de enlace de descarga -->
+            <!-- Sección de descarga con progreso -->
             <div id="downloadSection" class="hidden mb-8">
                 <div class="bg-gray-800 rounded-lg p-6">
                     <h3 id="currentEpisode" class="text-xl font-semibold mb-4"></h3>
                     
-                    <div class="bg-gray-700 rounded-lg p-6">
-                        <div class="text-center mb-4">
-                            <div class="inline-block p-3 bg-blue-600 rounded-full mb-3">
-                                <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                                </svg>
+                    <div id="downloadProgress" class="bg-gray-700 rounded-lg p-4">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="text-lg">Progreso de descarga:</span>
+                            <span id="progressStatus" class="status-badge status-connecting">Iniciando</span>
+                        </div>
+                        
+                        <!-- Barra de progreso -->
+                        <div class="w-full bg-gray-600 rounded-full h-6 mb-2">
+                            <div id="progressBar" class="progress-bar bg-gradient-to-r from-blue-500 to-purple-600 h-6 rounded-full text-xs text-white text-center leading-6" style="width: 0%">0%</div>
+                        </div>
+                        
+                        <!-- Detalles del progreso -->
+                        <div id="progressDetails" class="text-sm text-gray-300 mt-2 text-center">
+                            Conectando...
+                        </div>
+                        
+                        <!-- Velocidad y tiempo -->
+                        <div id="speedInfo" class="text-xs text-gray-400 mt-2 text-center">
+                            <span id="downloadSpeed">0 B/s</span> • <span id="timeRemaining">Calculando...</span>
+                        </div>
+                        
+                        <!-- ENLACE DIRECTO DE DESCARGA (aparece cuando está listo) -->
+                        <div id="downloadLinkContainer" class="hidden mt-6 text-center">
+                            <div class="border-t border-gray-600 pt-4">
+                                <p class="text-green-400 font-semibold mb-3">✅ ¡Descarga completada!</p>
+                                <a id="finalDownloadLink" href="#" class="final-download-btn" download>
+                                    ⬇️ DESCARGAR ARCHIVO
+                                </a>
+                                <p class="text-xs text-gray-400 mt-3">Haz clic para guardar el archivo en tu dispositivo</p>
+                                
+                                <!-- URL directa para copiar -->
+                                <div class="mt-4 flex items-center justify-center gap-2">
+                                    <input type="text" id="directUrlInput" readonly class="bg-gray-600 text-sm px-3 py-2 rounded-l w-64" value="">
+                                    <button onclick="copyDirectUrl()" class="copy-btn rounded-r">Copiar</button>
+                                </div>
                             </div>
-                            <h4 class="text-2xl font-bold text-white mb-2">¡Enlace generado!</h4>
-                            <p class="text-gray-400 mb-4">Haz clic en el botón para descargar el archivo directamente</p>
-                            
-                            <div id="downloadLinkContainer" class="mt-4">
-                                <!-- El enlace se insertará aquí dinámicamente -->
-                            </div>
-                            
-                            <p id="fileInfo" class="text-sm text-gray-500 mt-4"></p>
                         </div>
                     </div>
                 </div>
@@ -363,12 +482,17 @@ def index():
         <div id="loading" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
             <div class="bg-gray-800 rounded-lg p-8 text-center">
                 <div class="animate-spin rounded-full h-16 w-16 border-4 border-blue-500 border-t-transparent mx-auto mb-4"></div>
-                <p class="text-xl">Procesando...</p>
+                <p class="text-xl">Cargando...</p>
             </div>
         </div>
 
         <!-- Mensaje de error -->
         <div id="errorMessage" class="hidden fixed bottom-4 right-4 bg-red-600 text-white px-6 py-3 rounded-lg shadow-lg z-50"></div>
+        
+        <!-- Toast de copiado -->
+        <div id="copyToast" class="hidden fixed bottom-4 left-4 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg z-50">
+            URL copiada al portapapeles
+        </div>
     </div>
 
     <script>
@@ -376,6 +500,7 @@ def index():
         const appState = {
             currentAnime: null,
             currentEpisode: null,
+            currentDownloadId: null,
             sessionId: 'session_' + Math.random().toString(36).substr(2, 9),
             searchResults: []
         };
@@ -389,14 +514,44 @@ def index():
             resultsGrid: document.getElementById('resultsGrid'),
             episodesGrid: document.getElementById('episodesGrid'),
             loading: document.getElementById('loading'),
+            downloadProgress: document.getElementById('downloadProgress'),
+            progressBar: document.getElementById('progressBar'),
+            progressStatus: document.getElementById('progressStatus'),
+            progressDetails: document.getElementById('progressDetails'),
+            downloadSpeed: document.getElementById('downloadSpeed'),
+            timeRemaining: document.getElementById('timeRemaining'),
             downloadLinkContainer: document.getElementById('downloadLinkContainer'),
+            finalDownloadLink: document.getElementById('finalDownloadLink'),
+            directUrlInput: document.getElementById('directUrlInput'),
             currentEpisode: document.getElementById('currentEpisode'),
-            fileInfo: document.getElementById('fileInfo'),
             animeImage: document.getElementById('animeImage'),
             animeTitle: document.getElementById('animeTitle'),
             animeSinopsis: document.getElementById('animeSinopsis'),
-            errorMessage: document.getElementById('errorMessage')
+            errorMessage: document.getElementById('errorMessage'),
+            speedInfo: document.getElementById('speedInfo'),
+            copyToast: document.getElementById('copyToast')
         };
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatTime(seconds) {
+            if (!seconds || seconds < 0) return 'Calculando...';
+            if (seconds < 60) return Math.round(seconds) + ' segundos';
+            if (seconds < 3600) {
+                const mins = Math.floor(seconds / 60);
+                const secs = Math.round(seconds % 60);
+                return mins + ' min ' + secs + ' seg';
+            }
+            const hours = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            return hours + ' h ' + mins + ' min';
+        }
 
         function showLoading(show) {
             elements.loading.classList.toggle('hidden', !show);
@@ -410,13 +565,33 @@ def index():
             }, 5000);
         }
 
-        function formatBytes(bytes, decimals = 2) {
-            if (bytes === 0) return '0 Bytes';
-            const k = 1024;
-            const dm = decimals < 0 ? 0 : decimals;
-            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        function showCopyToast() {
+            elements.copyToast.classList.remove('hidden');
+            setTimeout(() => {
+                elements.copyToast.classList.add('hidden');
+            }, 2000);
+        }
+
+        function copyDirectUrl() {
+            const url = elements.directUrlInput.value;
+            if (url) {
+                navigator.clipboard.writeText(window.location.origin + url);
+                showCopyToast();
+            }
+        }
+
+        function updateStatusBadge(status) {
+            elements.progressStatus.className = 'status-badge';
+            const statusMap = {
+                'connecting': 'status-connecting',
+                'downloading': 'status-downloading',
+                'completed': 'status-completed',
+                'error': 'status-error'
+            };
+            elements.progressStatus.classList.add(statusMap[status] || 'status-connecting');
+            elements.progressStatus.textContent = status === 'connecting' ? 'Conectando' :
+                                                 status === 'downloading' ? 'Descargando' :
+                                                 status === 'completed' ? 'Completado' : 'Error';
         }
 
         async function searchAnime() {
@@ -472,11 +647,8 @@ def index():
         async function selectAnime(animeUrl) {
             showLoading(true);
             try {
-                console.log('Seleccionando anime:', animeUrl);
                 const response = await fetch(`/anime/${animeUrl}`);
                 const data = await response.json();
-                
-                console.log('Respuesta:', data);
                 
                 if (data.success) {
                     appState.currentAnime = data.anime;
@@ -498,18 +670,9 @@ def index():
         }
 
         function displayAnimeDetails(anime) {
-            if (anime.image) {
-                elements.animeImage.src = anime.image;
-            } else {
-                elements.animeImage.src = 'https://via.placeholder.com/400x600?text=Sin+Imagen';
-            }
-            
+            elements.animeImage.src = anime.image || 'https://via.placeholder.com/400x600?text=Sin+Imagen';
             elements.animeTitle.textContent = anime.title;
             elements.animeSinopsis.textContent = anime.sinopsis;
-
-            elements.animeImage.onerror = function() {
-                this.src = 'https://via.placeholder.com/400x600?text=Error+Imagen';
-            };
 
             if (!anime.episodies || anime.episodies.length === 0) {
                 elements.episodesGrid.innerHTML = '<p class="col-span-full text-gray-500">No hay episodios disponibles</p>';
@@ -518,7 +681,7 @@ def index():
 
             elements.episodesGrid.innerHTML = anime.episodies.map((epUrl, index) => `
                 <button 
-                    onclick="selectEpisode(${index + 1}, '${epUrl}')"
+                    onclick="downloadEpisode(${index + 1}, '${epUrl}')"
                     class="episode-btn px-4 py-3 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors text-sm font-medium text-center"
                 >
                     Ep. ${index + 1}
@@ -526,17 +689,24 @@ def index():
             `).join('');
         }
 
-        async function selectEpisode(episodeNum, episodeUrl) {
-            console.log('Seleccionando episodio:', episodeNum, episodeUrl);
+        async function downloadEpisode(episodeNum, episodeUrl) {
             appState.currentEpisode = { number: episodeNum, url: episodeUrl };
             
             elements.currentEpisode.textContent = `${appState.currentAnime.title} - Episodio ${episodeNum}`;
             elements.downloadSection.classList.remove('hidden');
-            elements.downloadLinkContainer.innerHTML = '<p class="text-gray-400">Generando enlace de descarga...</p>';
+            elements.downloadLinkContainer.classList.add('hidden');
+            
+            // Resetear progreso
+            elements.progressBar.style.width = '0%';
+            elements.progressBar.textContent = '0%';
+            updateStatusBadge('connecting');
+            elements.progressDetails.textContent = 'Iniciando descarga...';
+            elements.downloadSpeed.textContent = '0 B/s';
+            elements.timeRemaining.textContent = 'Calculando...';
 
             showLoading(true);
             try {
-                const response = await fetch('/episode/link', {
+                const response = await fetch('/episode/download', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -550,32 +720,70 @@ def index():
                 const data = await response.json();
                 
                 if (data.success) {
-                    // Mostrar el enlace de descarga
-                    const downloadUrl = `/download/${data.download_id}/${encodeURIComponent(data.filename)}`;
-                    
-                    elements.downloadLinkContainer.innerHTML = `
-                        <a href="${downloadUrl}" 
-                           class="download-link text-xl px-8 py-4" 
-                           target="_blank">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                            </svg>
-                            Descargar Episodio
-                        </a>
-                    `;
-                    
-                    elements.fileInfo.textContent = `Tamaño: ${formatBytes(data.filesize)} | Formato: MP4`;
+                    appState.currentDownloadId = data.download_id;
+                    startProgressMonitoring(data.download_id);
                 } else {
-                    showError('Error al generar enlace: ' + (data.error || 'Desconocido'));
+                    showError('Error al iniciar descarga: ' + (data.error || 'Desconocido'));
                     elements.downloadSection.classList.add('hidden');
                 }
             } catch (error) {
                 console.error('Error:', error);
-                showError('Error al procesar');
+                showError('Error al iniciar descarga');
                 elements.downloadSection.classList.add('hidden');
             } finally {
                 showLoading(false);
             }
+        }
+
+        function startProgressMonitoring(downloadId) {
+            const checkInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/progress/${downloadId}`);
+                    const data = await response.json();
+                    
+                    updateProgress(data);
+                    updateStatusBadge(data.status);
+                    
+                    if (data.status === 'completed') {
+                        clearInterval(checkInterval);
+                        showDownloadLink(data.download_url, data.filename);
+                    } else if (data.status === 'error') {
+                        clearInterval(checkInterval);
+                        elements.progressDetails.textContent = data.error || 'Error en la descarga';
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                }
+            }, 500);
+        }
+
+        function updateProgress(data) {
+            const percent = data.percent || 0;
+            elements.progressBar.style.width = percent + '%';
+            elements.progressBar.textContent = Math.round(percent) + '%';
+            elements.progressDetails.textContent = data.message || '';
+            
+            if (data.speed) {
+                elements.downloadSpeed.textContent = formatBytes(data.speed) + '/s';
+            }
+            
+            if (data.time_remaining) {
+                elements.timeRemaining.textContent = formatTime(data.time_remaining);
+            }
+        }
+
+        function showDownloadLink(downloadUrl, filename) {
+            // Mostrar el enlace directo de descarga
+            elements.finalDownloadLink.href = downloadUrl;
+            elements.finalDownloadLink.download = filename;
+            elements.directUrlInput.value = downloadUrl;
+            elements.downloadLinkContainer.classList.remove('hidden');
+            
+            // Actualizar mensaje
+            elements.progressDetails.textContent = '✅ Descarga completada. Haz clic en el botón para guardar el archivo.';
+            elements.speedInfo.classList.add('hidden');
+            
+            console.log('Enlace de descarga generado:', downloadUrl);
         }
 
         function backToSearch() {
@@ -583,12 +791,15 @@ def index():
             elements.animeDetails.classList.add('hidden');
             elements.downloadSection.classList.add('hidden');
             elements.navButtons.classList.add('hidden');
+            
+            // Detener monitoreo de progreso si está activo
+            if (appState.currentDownloadId) {
+                appState.currentDownloadId = null;
+            }
         }
 
         // Búsqueda inicial
-        document.addEventListener('DOMContentLoaded', () => {
-            searchAnime();
-        });
+        document.addEventListener('DOMContentLoaded', searchAnime);
     </script>
 </body>
 </html>
@@ -606,7 +817,6 @@ def anime_info_route(anime_url):
     try:
         anime_url = anime_url.replace("https://tioanime.com", "").replace("/anime/", "")
         full_url = f"{BASE}anime/{anime_url}"
-        print(f"Obteniendo info de: {full_url}")
         
         info = get_info(full_url)
         
@@ -623,9 +833,9 @@ def anime_info_route(anime_url):
         print(f"Error en ruta anime: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/episode/link', methods=['POST'])
-def episode_link_route():
-    """Genera un ID de descarga y devuelve el enlace"""
+@app.route('/episode/download', methods=['POST'])
+def episode_download_route():
+    """Inicia la descarga del episodio"""
     data = request.json
     url = data.get('url')
     session_id = data.get('session_id')
@@ -637,62 +847,73 @@ def episode_link_route():
     if not mega_url:
         return jsonify({'success': False, 'error': 'No se pudo obtener el enlace de Mega'})
     
-    print(f"Mega URL obtenida: {mega_url}")
+    # Crear ID único para esta descarga
+    download_id = str(uuid.uuid4())
     
-    # Obtener el iterador
-    download_id, filename, filesize = get_download_iterator(mega_url, session_id, episode_num, anime_title)
+    print(f"Iniciando descarga: {download_id} - {mega_url}")
     
-    if download_id:
-        return jsonify({
-            'success': True, 
-            'download_id': download_id,
-            'filename': filename,
-            'filesize': filesize,
-            'message': 'Enlace generado correctamente'
-        })
-    else:
-        return jsonify({'success': False, 'error': 'No se pudo obtener el iterador de descarga'})
-
-@app.route('/download/<download_id>/<path:filename>')
-def download_file_route(download_id, filename):
-    """Endpoint que usa el iterador para enviar el archivo"""
-    if download_id not in download_sessions:
-        return jsonify({'error': 'Sesión de descarga no encontrada'}), 404
-    
-    session = download_sessions[download_id]
-    iterator = session['iterator']
-    
-    def generate():
-        try:
-            for chunk in iterator:
-                if chunk:
-                    yield chunk
-        except Exception as e:
-            print(f"Error durante la transmisión: {e}")
-        finally:
-            # Limpiar la sesión después de la descarga
-            if download_id in download_sessions:
-                del download_sessions[download_id]
-    
-    response = Response(
-        stream_with_context(generate()),
-        mimetype='video/mp4',
-        headers={
-            'Content-Disposition': f'attachment; filename="{session["filename"]}"',
-            'Content-Length': str(session['filesize']) if session['filesize'] else None
-        }
+    # Iniciar hilo de descarga
+    thread = threading.Thread(
+        target=download_with_progress,
+        args=(mega_url, session_id, episode_num, anime_title, download_id)
     )
+    thread.daemon = True
+    thread.start()
     
-    return response
+    return jsonify({
+        'success': True,
+        'download_id': download_id,
+        'message': 'Descarga iniciada'
+    })
+
+@app.route('/progress/<download_id>')
+def progress_route(download_id):
+    """Obtiene el progreso de una descarga"""
+    progress = download_progress.get(download_id, {
+        'status': 'waiting',
+        'percent': 0,
+        'message': 'Esperando...'
+    })
+    return jsonify(progress)
+
+@app.route('/download/<session_id>/<filename>')
+def download_file_route(session_id, filename):
+    """Ruta para descargar el archivo completado - ENLACE DIRECTO"""
+    filepath = os.path.join(DOWNLOAD_DIR, session_id, filename)
+    
+    if os.path.exists(filepath):
+        return send_file(
+            filepath, 
+            as_attachment=True, 
+            download_name=filename,
+            mimetype='video/mp4'
+        )
+    
+    return jsonify({'error': 'Archivo no encontrado'}), 404
+
+@app.route('/file/<session_id>/<filename>')
+def stream_file_route(session_id, filename):
+    """Ruta alternativa para ver el archivo en el navegador"""
+    filepath = os.path.join(DOWNLOAD_DIR, session_id, filename)
+    
+    if os.path.exists(filepath):
+        return send_file(filepath, mimetype='video/mp4')
+    
+    return jsonify({'error': 'Archivo no encontrado'}), 404
 
 @app.route('/cleanup/<session_id>', methods=['POST'])
 def cleanup_route(session_id):
-    """Limpia las sesiones de descarga"""
+    """Limpia los archivos de una sesión"""
     try:
-        # Limpiar sesiones de descarga
-        keys_to_delete = [k for k, v in download_sessions.items() if v.get('session_id') == session_id]
+        session_dir = os.path.join(DOWNLOAD_DIR, session_id)
+        if os.path.exists(session_dir):
+            shutil.rmtree(session_dir)
+        
+        # Limpiar progreso asociado
+        keys_to_delete = [k for k, v in download_progress.items() 
+                         if v.get('session_id') == session_id]
         for key in keys_to_delete:
-            del download_sessions[key]
+            del download_progress[key]
             
         return jsonify({'success': True, 'cleaned': len(keys_to_delete)})
     except Exception as e:
@@ -700,35 +921,33 @@ def cleanup_route(session_id):
 
 @app.route('/sessions')
 def list_sessions():
-    """Endpoint para ver sesiones activas (debug)"""
-    sessions_info = {}
-    for download_id, session in download_sessions.items():
-        sessions_info[download_id] = {
-            'filename': session['filename'],
-            'filesize': session['filesize'],
-            'session_id': session['session_id'],
-            'episode_num': session['episode_num'],
-            'anime_title': session['anime_title'],
-            'downloaded': session.get('downloaded', 0),
-            'elapsed': time.time() - session.get('start_time', time.time())
+    """Lista todas las descargas activas"""
+    sessions = {}
+    for download_id, progress in download_progress.items():
+        sessions[download_id] = {
+            'status': progress.get('status'),
+            'percent': progress.get('percent'),
+            'message': progress.get('message'),
+            'downloaded': progress.get('downloaded', 0),
+            'total': progress.get('total', 0)
         }
-    return jsonify(sessions_info)
+    return jsonify(sessions)
 
 if __name__ == '__main__':
     print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║     AnimeStream - Streaming Directo con Iteradores      ║
+    ║     AnimeStream - Descarga con Enlace Directo            ║
     ║                                                          ║
     ║     🌐 http://localhost:5000                             ║
     ║                                                          ║
     ║  CARACTERÍSTICAS:                                        ║
-    ║  ✓ Búsqueda de animes desde TioAnime                    ║
-    ║  ✓ Información detallada (imagen + sinopsis)            ║
-    ║  ✓ Lista de episodios                                    ║
-    ║  ✓ Genera enlace directo /download/id/filename.mp4      ║
-    ║  ✓ Usa el iterador de pyobidl para transmitir           ║
-    ║  ✓ Sin almacenamiento en disco                          ║
-    ║  ✓ Streaming directo al navegador                       ║
+    ║  ✓ Descarga real de archivos Mega                        ║
+    ║  ✓ Barra de progreso en tiempo real                      ║
+    ║  ✓ Velocidad y tiempo restante                           ║
+    ║  ✓ Almacenamiento local en /downloads                    ║
+    ║  ✓ ENLACE DIRECTO: /download/session_id/filename.mp4     ║
+    ║  ✓ Botón grande para descargar                           ║
+    ║  ✓ URL copiable al portapapeles                          ║
     ║                                                          ║
     ║  Presiona Ctrl+C para detener                            ║
     ╚══════════════════════════════════════════════════════════╝
