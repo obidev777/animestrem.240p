@@ -1,76 +1,35 @@
-# app.py - VERSIÓN OPTIMIZADA PARA RENDER.COM
-import sys
-import asyncio
 import os
 import threading
 import uuid
 import shutil
 import requests
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from bs4 import BeautifulSoup
 import re
 import time
-
-# Parche para asyncio.coroutine (Python 3.11+)
-if not hasattr(asyncio, 'coroutine'):
-    asyncio.coroutine = lambda x: x
-    print("✅ Parche de compatibilidad aplicado")
-
-# Importar moviepy con manejo de errores
-try:
-    from moviepy.editor import VideoFileClip
-    MOVIEPY_AVAILABLE = True
-    print("✅ Moviepy cargado correctamente")
-except Exception as e:
-    MOVIEPY_AVAILABLE = False
-    print(f"⚠️ Moviepy no disponible: {e}")
-
-# Mega con manejo de errores
-try:
-    from mega import Mega
-    MEGA_AVAILABLE = True
-    print("✅ Mega.py cargado correctamente")
-except Exception as e:
-    MEGA_AVAILABLE = False
-    print(f"⚠️ Mega.py no disponible: {e}")
+from pyobidl.downloader import Downloader
+from pyobidl.utils import sizeof_fmt, createID
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(24).hex())
+app.config['SECRET_KEY'] = os.urandom(24).hex()
 
-# Configuración desde variables de entorno
-BASE = os.environ.get('BASE_URL', 'https://tioanime.com/')
-DIRECTORIO = os.environ.get('DIRECTORIO_URL', 'https://tioanime.com/directorio')
-
-# Directorios - Usar /tmp en Render (sistema de archivos efímero)
-if os.environ.get('RENDER') or os.path.exists('/tmp'):
-    DOWNLOAD_DIR = '/tmp/downloads'
-    STREAM_DIR = '/tmp/streams'
-    print("✅ Usando /tmp para almacenamiento (Render.com)")
-else:
-    DOWNLOAD_DIR = 'downloads'
-    STREAM_DIR = 'streams'
+# Configuración
+BASE = 'https://tioanime.com/'
+DIRECTORIO = 'https://tioanime.com/directorio'
+DOWNLOAD_DIR = 'downloads'
 
 # Crear directorios
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(STREAM_DIR, exist_ok=True)
 
-# Diccionario para progreso (en memoria, se perderá al reiniciar)
-conversion_progress = {}
+# Diccionarios para seguimiento
+processes = {}  # Almacena info de descargas
+download_sessions = {}  # Almacena sesiones activas
 
-# Inicializar cliente Mega solo si está disponible
-mega_api = None
-if MEGA_AVAILABLE:
-    try:
-        mega_api = Mega()
-        print("✅ Cliente Mega inicializado")
-    except Exception as e:
-        print(f"⚠️ Error inicializando Mega: {e}")
-
-# ===== TUS FUNCIONES ORIGINALES (sin cambios) =====
+# ===== FUNCIONES DE EXTRACCIÓN DE TIOANIME =====
 def get_anime_info(list):
     info = []
     for ep in list.contents:
-        if ep == '\n':continue
+        if ep == '\n': continue
         animename = ep.contents[1].contents[1].contents[3].next
         animeurl = ep.contents[1].contents[1].attrs['href']
         animefigure = ''
@@ -82,18 +41,15 @@ def get_anime_info(list):
         if not animefigure.startswith('http'):
             animefigure = f'https://tioanime.com{animefigure}'
             
-        info.append({'Anime':animename,'Url':animeurl,'Image':animefigure})
+        info.append({'Anime': animename, 'Url': animeurl, 'Image': animefigure})
     return info
 
-def search(searched,named=True):
+def search(searched):
     try:
         url = DIRECTORIO + '?q=' + str(searched)
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
-        html = str(resp.text).replace('/uploads','https://tioanime.com/uploads')
-        html = html.replace('/anime','https://tioanime.com/anime')
+        resp = requests.get(url)
+        html = str(resp.text).replace('/uploads', 'https://tioanime.com/uploads')
+        html = html.replace('/anime', 'https://tioanime.com/anime')
         soup = BeautifulSoup(html, "html.parser")
         animes = get_anime_info(soup.find_all('ul')[1])
         return animes
@@ -114,17 +70,14 @@ def get_mega(list):
 
 def get_mega_url(url):
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url)
         soup = BeautifulSoup(resp.text, "html.parser")
         link = get_mega(soup.find_all('td'))
         
         if not link:
             return None
             
-        mega = link.replace('https://mega.nz','https://mega.nz/file')
+        mega = link.replace('https://mega.nz', 'https://mega.nz/file')
         code = mega.split('/')[-1]
         
         if '!' in code:
@@ -141,22 +94,19 @@ def get_mega_url(url):
 def get_info(url):
     episodies = []
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
-        html = resp.text.replace('/ver','https://tioanime.com/ver')
+        resp = requests.get(url)
+        html = resp.text.replace('/ver', 'https://tioanime.com/ver')
         soup = BeautifulSoup(html, "html.parser")
         
-        script = str(soup.find_all('script')[-1].next).replace(' ','').replace('\n','').replace('\r','')
+        script = str(soup.find_all('script')[-1].next).replace(' ', '').replace('\n', '').replace('\r', '')
         tokens = script.split(';')
         epis = tokens[1].split(',')
         index = 1
         for ep in epis:
-            episodies.append(str(url).replace('anime/','ver/')+'-'+str(index))
-            index+=1
+            episodies.append(str(url).replace('anime/', 'ver/') + '-' + str(index))
+            index += 1
             
-        sinopsis_elem = soup.find('p',{'class':'sinopsis'})
+        sinopsis_elem = soup.find('p', {'class': 'sinopsis'})
         sinopsis = sinopsis_elem.next if sinopsis_elem else "Sin sinopsis disponible"
         
         title_elem = soup.find('h1')
@@ -178,6 +128,14 @@ def get_info(url):
             if meta_img and meta_img.get('content'):
                 image = meta_img.get('content')
         
+        if not image:
+            all_images = soup.find_all('img')
+            for img in all_images:
+                src = img.get('src', '')
+                if 'anime' in src or 'cover' in src or 'portada' in src:
+                    image = src
+                    break
+        
         # Asegurar URL completa
         if image and not image.startswith('http'):
             if image.startswith('//'):
@@ -197,210 +155,50 @@ def get_info(url):
         print(f"Error en get_info: {e}")
         return {'title': 'Error', 'sinopsis': str(e), 'image': '', 'episodies': []}
 
-# ===== FUNCIÓN DE CONVERSIÓN ADAPTADA PARA RENDER =====
-def convert_to_240p_simple(input_path, output_path, progress_key):
-    """Versión simplificada sin moviepy (solo copia el archivo)"""
+# ===== FUNCIÓN PARA OBTENER ITERADOR DE DESCARGA =====
+def get_download_iterator(mega_url, session_id, episode_num, anime_title):
+    """Obtiene el iterador de descarga de pyobidl"""
     try:
-        conversion_progress[progress_key] = {
-            'status': 'processing',
-            'percent': 80,
-            'message': 'Procesando video para streaming...'
+        # Crear downloader
+        dl = Downloader()
+        
+        # Obtener info del archivo
+        info = dl.download_info(mega_url)
+        print(f"Info de Mega: {info}")
+        
+        if not info:
+            raise Exception("No se pudo obtener información del archivo")
+        
+        file_info = info[0] if isinstance(info, list) else info
+        filename = file_info.get('fname', f"{anime_title}_ep{episode_num}.mp4")
+        filesize = file_info.get('fsize', 0)
+        
+        # Obtener el iterador
+        iterator = file_info['iter']
+        
+        # Crear ID único para esta sesión
+        download_id = str(uuid.uuid4())
+        
+        # Guardar información de la sesión
+        download_sessions[download_id] = {
+            'iterator': iterator,
+            'filename': filename,
+            'filesize': filesize,
+            'session_id': session_id,
+            'episode_num': episode_num,
+            'anime_title': anime_title,
+            'info': file_info,
+            'downloaded': 0,
+            'start_time': time.time()
         }
         
-        # En Render, moviepy puede no funcionar, así que simplemente copiamos
-        # el archivo como si estuviera convertido
-        import shutil
-        shutil.copy2(input_path, output_path)
-        
-        conversion_progress[progress_key] = {
-            'status': 'completed',
-            'percent': 100,
-            'message': 'Video listo para streaming'
-        }
-        
-        return True
-    except Exception as e:
-        print(f"Error en conversión simple: {e}")
-        return False
-
-def convert_to_240p_with_moviepy(input_path, output_path, progress_key):
-    """Convierte video a 240p usando moviepy (si está disponible)"""
-    if not MOVIEPY_AVAILABLE:
-        print("Moviepy no disponible, usando copia simple")
-        return convert_to_240p_simple(input_path, output_path, progress_key)
-    
-    try:
-        conversion_progress[progress_key] = {
-            'status': 'converting',
-            'percent': 60,
-            'message': 'Cargando video...'
-        }
-        
-        clip = VideoFileClip(input_path)
-        
-        conversion_progress[progress_key] = {
-            'status': 'converting',
-            'percent': 70,
-            'message': 'Redimensionando a 240p...'
-        }
-        
-        clip_resized = clip.resize(height=240)
-        
-        conversion_progress[progress_key] = {
-            'status': 'converting',
-            'percent': 80,
-            'message': 'Ajustando audio...'
-        }
-        
-        clip_resized = clip_resized.volumex(1.0)
-        
-        conversion_progress[progress_key] = {
-            'status': 'converting',
-            'percent': 85,
-            'message': 'Escribiendo archivo final...'
-        }
-        
-        # Configuración más ligera para Render
-        clip_resized.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            bitrate='300k',
-            audio_bitrate='64k',
-            preset='ultrafast',
-            threads=1,  # Menos threads para Render
-            logger=None
-        )
-        
-        clip.close()
-        clip_resized.close()
-        
-        conversion_progress[progress_key] = {
-            'status': 'processing',
-            'percent': 95,
-            'message': 'Optimizando para streaming...'
-        }
-        
-        return True
+        return download_id, filename, filesize
         
     except Exception as e:
-        print(f"Error en conversión con moviepy: {e}")
-        # Fallback a copia simple
-        return convert_to_240p_simple(input_path, output_path, progress_key)
+        print(f"Error al obtener iterador: {e}")
+        return None, None, 0
 
-# ===== FUNCIÓN DE DESCARGA ADAPTADA PARA RENDER =====
-def download_and_convert(mega_url, session_id, episode_num, anime_title):
-    """Descarga desde Mega y convierte (adaptado para Render)"""
-    try:
-        session_dir = os.path.join(STREAM_DIR, session_id)
-        os.makedirs(session_dir, exist_ok=True)
-        
-        safe_title = re.sub(r'[^\w\s-]', '', anime_title).strip().replace(' ', '_')
-        temp_filename = f"{safe_title}_ep{episode_num}_temp.mp4"
-        final_filename = f"{safe_title}_ep{episode_num}.mp4"
-        
-        temp_file = os.path.join(session_dir, temp_filename)
-        output_file = os.path.join(session_dir, final_filename)
-        
-        progress_key = f"{session_id}_{episode_num}"
-        
-        # Verificar si ya existe
-        if os.path.exists(output_file):
-            conversion_progress[progress_key] = {
-                'status': 'completed',
-                'percent': 100,
-                'file': f"/stream/{session_id}/{final_filename}",
-                'filename': final_filename,
-                'size': os.path.getsize(output_file),
-                'message': 'Video ya disponible'
-            }
-            return output_file
-        
-        conversion_progress[progress_key] = {
-            'status': 'connecting',
-            'percent': 5,
-            'message': 'Conectando a Mega...'
-        }
-        
-        if not MEGA_AVAILABLE or not mega_api:
-            # Si Mega no está disponible, crear un archivo de prueba
-            conversion_progress[progress_key] = {
-                'status': 'downloading',
-                'percent': 10,
-                'message': 'Modo demostración: Creando video de prueba...'
-            }
-            
-            # Crear un archivo de texto como placeholder
-            with open(output_file, 'w') as f:
-                f.write(f"VIDEO PLACEHOLDER - {anime_title} Episodio {episode_num}\n")
-                f.write(f"URL original: {mega_url}\n")
-                f.write("Modo demostración - Mega no disponible en Render")
-            
-            conversion_progress[progress_key] = {
-                'status': 'completed',
-                'percent': 100,
-                'file': f"/stream/{session_id}/{final_filename}",
-                'filename': final_filename,
-                'size': os.path.getsize(output_file),
-                'message': 'Video de demostración listo'
-            }
-            return output_file
-        
-        # Descarga real con Mega
-        mega = mega_api.login()
-        
-        conversion_progress[progress_key] = {
-            'status': 'downloading',
-            'percent': 10,
-            'message': 'Iniciando descarga...'
-        }
-        
-        print(f"Descargando desde Mega: {mega_url}")
-        mega.download_url(mega_url, session_dir, dest_filename=temp_filename)
-        
-        if not os.path.exists(temp_file):
-            raise Exception("Error en la descarga: archivo no encontrado")
-        
-        file_size = os.path.getsize(temp_file)
-        print(f"Archivo descargado: {temp_file}, tamaño: {file_size} bytes")
-        
-        conversion_progress[progress_key] = {
-            'status': 'downloaded',
-            'percent': 50,
-            'message': f'Descarga completada ({file_size/1024/1024:.1f} MB)'
-        }
-        
-        # Convertir
-        success = convert_to_240p_with_moviepy(temp_file, output_file, progress_key)
-        
-        # Eliminar temporal
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        
-        if os.path.exists(output_file):
-            final_size = os.path.getsize(output_file)
-            conversion_progress[progress_key] = {
-                'status': 'completed',
-                'percent': 100,
-                'file': f"/stream/{session_id}/{final_filename}",
-                'filename': final_filename,
-                'size': final_size,
-                'message': f'¡Video listo! ({final_size/1024/1024:.1f} MB)'
-            }
-            return output_file
-        else:
-            raise Exception("Archivo no encontrado después de la conversión")
-            
-    except Exception as e:
-        print(f"Error en download_and_convert: {e}")
-        conversion_progress[progress_key] = {
-            'status': 'error',
-            'error': str(e),
-            'message': f'Error: {str(e)}'
-        }
-        return None
-
-# ===== RUTA PRINCIPAL =====
+# ===== RUTAS DE FLASK =====
 @app.route('/')
 def index():
     return Response('''
@@ -409,34 +207,41 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AnimeStream 240p - Streaming de Anime</title>
+    <title>AnimeStream - Descarga Directa con Iterador</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @keyframes spin { to { transform: rotate(360deg); } }
         .animate-spin { animation: spin 1s linear infinite; }
-        .video-container { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; }
-        .video-container video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
-        .progress-bar { transition: width 0.3s ease; }
         .anime-card { transition: transform 0.2s, box-shadow 0.2s; cursor: pointer; }
         .anime-card:hover { transform: translateY(-4px); box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.5); }
-        .status-badge {
+        .download-btn {
             display: inline-block;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-size: 0.875rem;
-            font-weight: 600;
-        }
-        .status-connecting { background-color: #f59e0b; color: #000; }
-        .status-downloading { background-color: #3b82f6; color: #fff; }
-        .status-downloaded { background-color: #10b981; color: #fff; }
-        .status-converting { background-color: #8b5cf6; color: #fff; }
-        .status-processing { background-color: #ec4899; color: #fff; }
-        .status-completed { background-color: #10b981; color: #fff; }
-        .status-error { background-color: #ef4444; color: #fff; }
-        .anime-detail-image {
-            max-height: 400px;
-            object-fit: cover;
+            padding: 0.75rem 1.5rem;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
             border-radius: 0.5rem;
+            font-weight: bold;
+            text-decoration: none;
+            transition: transform 0.2s;
+        }
+        .download-btn:hover {
+            transform: scale(1.05);
+        }
+        .download-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.5rem;
+            background: #10b981;
+            color: white;
+            border-radius: 0.5rem;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .download-link:hover {
+            background: #059669;
+            transform: scale(1.02);
         }
     </style>
 </head>
@@ -445,12 +250,9 @@ def index():
         <!-- Header -->
         <header class="mb-8 text-center">
             <h1 class="text-4xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent mb-2">
-                🎬 AnimeStream 240p
+                🎬 AnimeStream Directo
             </h1>
-            <p class="text-gray-400">Streaming de anime optimizado para bajo consumo</p>
-            <div class="mt-2 text-xs text-gray-500">
-                Modo: ''' + ('Producción' if os.environ.get('RENDER') else 'Desarrollo') + '''
-            </div>
+            <p class="text-gray-400">Streaming directo desde Mega usando iteradores</p>
         </header>
 
         <!-- Barra de búsqueda -->
@@ -459,7 +261,7 @@ def index():
                 <input 
                     type="text" 
                     id="searchInput"
-                    placeholder="Buscar anime (ej: isekai, shingeki, one piece...)" 
+                    placeholder="Buscar anime (ej: shingeki, one piece, jujutsu...)" 
                     class="flex-1 px-4 py-3 bg-gray-800 rounded-lg border border-gray-700 focus:border-blue-500 focus:outline-none text-white"
                     value="isekai"
                     onkeypress="if(event.key==='Enter') searchAnime()"
@@ -496,17 +298,22 @@ def index():
             <div id="animeDetails" class="hidden mb-8">
                 <div class="bg-gray-800 rounded-lg p-6">
                     <div class="flex flex-col md:flex-row gap-8">
+                        <!-- Imagen del anime -->
                         <div class="w-full md:w-80 flex-shrink-0">
                             <img id="animeImage" src="" alt="" 
-                                 class="w-full rounded-lg shadow-2xl anime-detail-image"
+                                 class="w-full rounded-lg shadow-2xl"
                                  onerror="this.src='https://via.placeholder.com/400x600?text=No+Image'">
                         </div>
+                        
+                        <!-- Info del anime -->
                         <div class="flex-1">
                             <h2 id="animeTitle" class="text-3xl md:text-4xl font-bold mb-4 text-blue-400"></h2>
                             <div class="bg-gray-700 rounded-lg p-4 mb-6">
                                 <h3 class="text-xl font-semibold mb-2 text-gray-300">Sinopsis:</h3>
                                 <p id="animeSinopsis" class="text-gray-300 leading-relaxed"></p>
                             </div>
+                            
+                            <!-- Episodios -->
                             <h3 class="text-2xl font-semibold mb-4 text-purple-400">Episodios disponibles:</h3>
                             <div id="episodesGrid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
                                 <div class="col-span-full text-gray-500">Cargando episodios...</div>
@@ -516,22 +323,27 @@ def index():
                 </div>
             </div>
 
-            <!-- Reproductor -->
-            <div id="playerSection" class="hidden mb-8">
+            <!-- Sección de enlace de descarga -->
+            <div id="downloadSection" class="hidden mb-8">
                 <div class="bg-gray-800 rounded-lg p-6">
                     <h3 id="currentEpisode" class="text-xl font-semibold mb-4"></h3>
-                    <div id="videoContainer" class="video-container bg-black rounded-lg mb-4 hidden">
-                        <video id="videoPlayer" controls class="w-full"></video>
-                    </div>
-                    <div id="downloadProgress" class="bg-gray-700 rounded-lg p-4">
-                        <div class="flex justify-between items-center mb-2">
-                            <span class="text-lg">Procesando episodio:</span>
-                            <span id="progressStatus" class="status-badge status-connecting">Iniciando</span>
+                    
+                    <div class="bg-gray-700 rounded-lg p-6">
+                        <div class="text-center mb-4">
+                            <div class="inline-block p-3 bg-blue-600 rounded-full mb-3">
+                                <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                                </svg>
+                            </div>
+                            <h4 class="text-2xl font-bold text-white mb-2">¡Enlace generado!</h4>
+                            <p class="text-gray-400 mb-4">Haz clic en el botón para descargar el archivo directamente</p>
+                            
+                            <div id="downloadLinkContainer" class="mt-4">
+                                <!-- El enlace se insertará aquí dinámicamente -->
+                            </div>
+                            
+                            <p id="fileInfo" class="text-sm text-gray-500 mt-4"></p>
                         </div>
-                        <div class="w-full bg-gray-600 rounded-full h-4">
-                            <div id="progressBar" class="progress-bar bg-gradient-to-r from-blue-500 to-purple-600 h-4 rounded-full" style="width: 0%"></div>
-                        </div>
-                        <div id="progressDetails" class="text-sm text-gray-400 mt-2 text-center"></div>
                     </div>
                 </div>
             </div>
@@ -541,7 +353,7 @@ def index():
         <div id="loading" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
             <div class="bg-gray-800 rounded-lg p-8 text-center">
                 <div class="animate-spin rounded-full h-16 w-16 border-4 border-blue-500 border-t-transparent mx-auto mb-4"></div>
-                <p class="text-xl">Cargando...</p>
+                <p class="text-xl">Procesando...</p>
             </div>
         </div>
 
@@ -550,6 +362,7 @@ def index():
     </div>
 
     <script>
+        // Estado de la aplicación
         const appState = {
             currentAnime: null,
             currentEpisode: null,
@@ -557,21 +370,18 @@ def index():
             searchResults: []
         };
 
+        // Elementos DOM
         const elements = {
             searchResults: document.getElementById('searchResults'),
             animeDetails: document.getElementById('animeDetails'),
-            playerSection: document.getElementById('playerSection'),
+            downloadSection: document.getElementById('downloadSection'),
             navButtons: document.getElementById('navButtons'),
             resultsGrid: document.getElementById('resultsGrid'),
             episodesGrid: document.getElementById('episodesGrid'),
             loading: document.getElementById('loading'),
-            videoContainer: document.getElementById('videoContainer'),
-            videoPlayer: document.getElementById('videoPlayer'),
-            downloadProgress: document.getElementById('downloadProgress'),
-            progressBar: document.getElementById('progressBar'),
-            progressStatus: document.getElementById('progressStatus'),
-            progressDetails: document.getElementById('progressDetails'),
+            downloadLinkContainer: document.getElementById('downloadLinkContainer'),
             currentEpisode: document.getElementById('currentEpisode'),
+            fileInfo: document.getElementById('fileInfo'),
             animeImage: document.getElementById('animeImage'),
             animeTitle: document.getElementById('animeTitle'),
             animeSinopsis: document.getElementById('animeSinopsis'),
@@ -590,19 +400,13 @@ def index():
             }, 5000);
         }
 
-        function updateStatusBadge(status) {
-            elements.progressStatus.className = 'status-badge';
-            const statusMap = {
-                'connecting': 'status-connecting',
-                'downloading': 'status-downloading',
-                'downloaded': 'status-downloaded',
-                'converting': 'status-converting',
-                'processing': 'status-processing',
-                'completed': 'status-completed',
-                'error': 'status-error'
-            };
-            elements.progressStatus.classList.add(statusMap[status] || 'status-connecting');
-            elements.progressStatus.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
         }
 
         async function searchAnime() {
@@ -622,7 +426,7 @@ def index():
                 
                 elements.searchResults.classList.remove('hidden');
                 elements.animeDetails.classList.add('hidden');
-                elements.playerSection.classList.add('hidden');
+                elements.downloadSection.classList.add('hidden');
                 elements.navButtons.classList.add('hidden');
                 
             } catch (error) {
@@ -670,7 +474,7 @@ def index():
                     
                     elements.searchResults.classList.add('hidden');
                     elements.animeDetails.classList.remove('hidden');
-                    elements.playerSection.classList.add('hidden');
+                    elements.downloadSection.classList.add('hidden');
                     elements.navButtons.classList.remove('hidden');
                 } else {
                     showError('Error al cargar anime');
@@ -717,17 +521,12 @@ def index():
             appState.currentEpisode = { number: episodeNum, url: episodeUrl };
             
             elements.currentEpisode.textContent = `${appState.currentAnime.title} - Episodio ${episodeNum}`;
-            elements.playerSection.classList.remove('hidden');
-            elements.videoContainer.classList.add('hidden');
-            elements.downloadProgress.classList.remove('hidden');
-            
-            elements.progressBar.style.width = '0%';
-            updateStatusBadge('connecting');
-            elements.progressDetails.textContent = 'Obteniendo enlace de Mega...';
+            elements.downloadSection.classList.remove('hidden');
+            elements.downloadLinkContainer.innerHTML = '<p class="text-gray-400">Generando enlace de descarga...</p>';
 
             showLoading(true);
             try {
-                const response = await fetch('/episode/process', {
+                const response = await fetch('/episode/link', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -739,65 +538,44 @@ def index():
                 });
                 
                 const data = await response.json();
+                
                 if (data.success) {
-                    startProgressMonitoring(episodeNum);
+                    // Mostrar el enlace de descarga
+                    const downloadUrl = `/download/${data.download_id}/${encodeURIComponent(data.filename)}`;
+                    
+                    elements.downloadLinkContainer.innerHTML = `
+                        <a href="${downloadUrl}" 
+                           class="download-link text-xl px-8 py-4" 
+                           target="_blank">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                            </svg>
+                            Descargar Episodio
+                        </a>
+                    `;
+                    
+                    elements.fileInfo.textContent = `Tamaño: ${formatBytes(data.filesize)} | Formato: MP4`;
                 } else {
-                    showError('Error al procesar episodio');
+                    showError('Error al generar enlace: ' + (data.error || 'Desconocido'));
+                    elements.downloadSection.classList.add('hidden');
                 }
             } catch (error) {
                 console.error('Error:', error);
                 showError('Error al procesar');
+                elements.downloadSection.classList.add('hidden');
             } finally {
                 showLoading(false);
             }
         }
 
-        function startProgressMonitoring(episodeNum) {
-            const checkInterval = setInterval(async () => {
-                try {
-                    const response = await fetch(`/progress/${appState.sessionId}/${episodeNum}`);
-                    const data = await response.json();
-                    
-                    updateProgress(data);
-                    updateStatusBadge(data.status);
-                    
-                    if (data.status === 'completed' && data.file) {
-                        clearInterval(checkInterval);
-                        playVideo(data.file, episodeNum);
-                    } else if (data.status === 'error') {
-                        clearInterval(checkInterval);
-                        elements.progressDetails.textContent = data.error || 'Error en la descarga';
-                    }
-                } catch (error) {
-                    console.error('Error:', error);
-                }
-            }, 1000);
-        }
-
-        function updateProgress(data) {
-            elements.progressBar.style.width = data.percent + '%';
-            elements.progressDetails.textContent = data.message || '';
-        }
-
-        function playVideo(fileUrl, episodeNum) {
-            elements.videoContainer.classList.remove('hidden');
-            elements.videoPlayer.src = fileUrl;
-            elements.videoPlayer.load();
-            elements.videoPlayer.play().catch(e => console.log('Autoplay prevented:', e));
-            
-            setTimeout(() => {
-                elements.downloadProgress.classList.add('hidden');
-            }, 3000);
-        }
-
         function backToSearch() {
             elements.searchResults.classList.remove('hidden');
             elements.animeDetails.classList.add('hidden');
-            elements.playerSection.classList.add('hidden');
+            elements.downloadSection.classList.add('hidden');
             elements.navButtons.classList.add('hidden');
-            elements.videoPlayer.pause();
         }
 
+        // Búsqueda inicial
         document.addEventListener('DOMContentLoaded', () => {
             searchAnime();
         });
@@ -835,8 +613,9 @@ def anime_info_route(anime_url):
         print(f"Error en ruta anime: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/episode/process', methods=['POST'])
-def process_episode_route():
+@app.route('/episode/link', methods=['POST'])
+def episode_link_route():
+    """Genera un ID de descarga y devuelve el enlace"""
     data = request.json
     url = data.get('url')
     session_id = data.get('session_id')
@@ -850,73 +629,98 @@ def process_episode_route():
     
     print(f"Mega URL obtenida: {mega_url}")
     
-    thread = threading.Thread(
-        target=download_and_convert,
-        args=(mega_url, session_id, episode_num, anime_title)
+    # Obtener el iterador
+    download_id, filename, filesize = get_download_iterator(mega_url, session_id, episode_num, anime_title)
+    
+    if download_id:
+        return jsonify({
+            'success': True, 
+            'download_id': download_id,
+            'filename': filename,
+            'filesize': filesize,
+            'message': 'Enlace generado correctamente'
+        })
+    else:
+        return jsonify({'success': False, 'error': 'No se pudo obtener el iterador de descarga'})
+
+@app.route('/download/<download_id>/<path:filename>')
+def download_file_route(download_id, filename):
+    """Endpoint que usa el iterador para enviar el archivo"""
+    if download_id not in download_sessions:
+        return jsonify({'error': 'Sesión de descarga no encontrada'}), 404
+    
+    session = download_sessions[download_id]
+    iterator = session['iterator']
+    
+    def generate():
+        try:
+            for chunk in iterator:
+                if chunk:
+                    yield chunk
+        except Exception as e:
+            print(f"Error durante la transmisión: {e}")
+        finally:
+            # Limpiar la sesión después de la descarga
+            if download_id in download_sessions:
+                del download_sessions[download_id]
+    
+    response = Response(
+        stream_with_context(generate()),
+        mimetype='video/mp4',
+        headers={
+            'Content-Disposition': f'attachment; filename="{session["filename"]}"',
+            'Content-Length': str(session['filesize']) if session['filesize'] else None
+        }
     )
-    thread.daemon = True
-    thread.start()
     
-    return jsonify({'success': True, 'message': 'Procesando episodio...'})
-
-@app.route('/progress/<session_id>/<int:episode_num>')
-def progress_route(session_id, episode_num):
-    key = f"{session_id}_{episode_num}"
-    progress = conversion_progress.get(key, {
-        'status': 'waiting',
-        'percent': 0,
-        'message': 'Esperando...'
-    })
-    return jsonify(progress)
-
-@app.route('/stream/<session_id>/<filename>')
-def stream_video_route(session_id, filename):
-    video_path = os.path.join(STREAM_DIR, session_id, filename)
-    
-    if os.path.exists(video_path):
-        return send_file(video_path, mimetype='video/mp4')
-    
-    return jsonify({'error': 'Video no encontrado'}), 404
-
-@app.route('/health')
-def health():
-    """Endpoint para verificar que la app está funcionando"""
-    return jsonify({
-        'status': 'healthy',
-        'moviepy': MOVIEPY_AVAILABLE,
-        'mega': MEGA_AVAILABLE,
-        'storage': STREAM_DIR
-    })
+    return response
 
 @app.route('/cleanup/<session_id>', methods=['POST'])
 def cleanup_route(session_id):
+    """Limpia las sesiones de descarga"""
     try:
-        session_dir = os.path.join(STREAM_DIR, session_id)
-        if os.path.exists(session_dir):
-            shutil.rmtree(session_dir)
-        return jsonify({'success': True})
+        # Limpiar sesiones de descarga
+        keys_to_delete = [k for k, v in download_sessions.items() if v.get('session_id') == session_id]
+        for key in keys_to_delete:
+            del download_sessions[key]
+            
+        return jsonify({'success': True, 'cleaned': len(keys_to_delete)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/sessions')
+def list_sessions():
+    """Endpoint para ver sesiones activas (debug)"""
+    sessions_info = {}
+    for download_id, session in download_sessions.items():
+        sessions_info[download_id] = {
+            'filename': session['filename'],
+            'filesize': session['filesize'],
+            'session_id': session['session_id'],
+            'episode_num': session['episode_num'],
+            'anime_title': session['anime_title'],
+            'downloaded': session.get('downloaded', 0),
+            'elapsed': time.time() - session.get('start_time', time.time())
+        }
+    return jsonify(sessions_info)
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    
-    print(f"""
+    print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║     AnimeStream 240p - Servidor para Render.com          ║
+    ║     AnimeStream - Streaming Directo con Iteradores      ║
     ║                                                          ║
-    ║     📡 Puerto: {port}                                      ║
-    ║     🎬 Moviepy: {'✓' if MOVIEPY_AVAILABLE else '✗'}                        ║
-    ║     📦 Mega.py: {'✓' if MEGA_AVAILABLE else '✗'}                           ║
-    ║     💾 Almacenamiento: {STREAM_DIR}  ║
+    ║     🌐 http://localhost:5000                             ║
     ║                                                          ║
-    ║  Notas para Render:                                      ║
-    ║  • Los archivos se guardan en /tmp (efímero)            ║
-    ║  • La descarga real de Mega puede no funcionar           ║
-    ║  • Usa el health check en /health                        ║
+    ║  CARACTERÍSTICAS:                                        ║
+    ║  ✓ Búsqueda de animes desde TioAnime                    ║
+    ║  ✓ Información detallada (imagen + sinopsis)            ║
+    ║  ✓ Lista de episodios                                    ║
+    ║  ✓ Genera enlace directo /download/id/filename.mp4      ║
+    ║  ✓ Usa el iterador de pyobidl para transmitir           ║
+    ║  ✓ Sin almacenamiento en disco                          ║
+    ║  ✓ Streaming directo al navegador                       ║
     ║                                                          ║
+    ║  Presiona Ctrl+C para detener                            ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(debug=True, port=5000, threaded=True)
